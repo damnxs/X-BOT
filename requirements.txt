@@ -1,0 +1,7 @@
+openai>=1.0.0
+playwright>=1.40.0
+pyyaml>=6.0
+fastapi>=0.110
+uvicorn[standard]>=0.27
+apscheduler>=3.10
+cryptography>=42.0

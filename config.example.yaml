@@ -1,0 +1,43 @@
+# Copy to config.yaml and fill in your values. config.yaml is gitignored.
+# No OpenAI key is required — the bot runs like/retweet-only by default.
+
+x:
+  # DevTools -> Application -> Cookies -> https://x.com
+  auth_token: "PASTE_HERE"
+  ct0: "PASTE_HERE"
+  username: "yourhandle"     # without @, used to skip your own tweets
+
+behavior:
+  mode: search               # search | timeline
+  keywords: ["AI", "startups"]
+
+  # active now (no API key needed) — one engagement per found tweet:
+  max_likes: 5
+  max_retweets: 2
+  like_probability: 0.6      # weight vs retweet_probability
+  retweet_probability: 0.4
+
+  # dormant — needs an OpenAI key (see openai: below) to activate:
+  max_posts: 0
+  max_replies: 0
+
+  min_delay_seconds: 30
+  max_delay_seconds: 90
+  dry_run: true              # SAFE DEFAULT. set false to actually engage
+
+playwright:
+  headless: true             # set false to watch the browser
+  slow_mo_ms: 0              # ms added to each playwright action (debug aid)
+
+logging:
+  level: DEBUG               # console stays INFO regardless; files use this
+  screenshots: true          # capture screenshot + html on failure
+
+# Optional — only needed to enable LLM posting/replying later.
+# Uncomment, set max_posts/max_replies > 0 above, and the bot will use it.
+# openai:
+#   api_key: "sk-..."        # or export OPENAI_API_KEY env var (env wins)
+#   model: "gpt-4o-mini"
+#   system_prompt: >
+#     You write short, friendly, on-topic X/Twitter messages.
+#     Stay under 270 characters. No hashtags spam. No quotes around the message.
