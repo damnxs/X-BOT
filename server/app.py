@@ -9,11 +9,14 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from server import db, scheduler
+from server import auth, db, proxy, scheduler
+from server import logging_config
+
+logging_config.setup_logging()
 
 app = FastAPI(title="X Bot")
 app.add_middleware(
@@ -26,8 +29,49 @@ app.add_middleware(
 
 @app.on_event("startup")
 def _startup():
+    logging_config.fold_uvicorn()
     db.init_db()
     scheduler.start()
+    if auth.auth_enabled() and not auth.password_configured():
+        print("WARNING: auth is enabled but XBOT_UI_PASSWORD is not set — login is "
+              "impossible. Set XBOT_UI_PASSWORD, or XBOT_AUTH_DISABLED=1 for dev.")
+
+
+# ---- auth -------------------------------------------------------------
+
+class LoginIn(BaseModel):
+    password: str
+
+
+@app.post("/api/login")
+def login(body: LoginIn):
+    if not auth.check_password(body.password):
+        raise HTTPException(401, "wrong password")
+    resp = JSONResponse({"ok": True})
+    resp.set_cookie("session", auth.make_session(), httponly=True,
+                    samesite="lax", max_age=7 * 86400)
+    return resp
+
+
+@app.post("/api/logout")
+def logout():
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie("session")
+    return resp
+
+
+@app.get("/api/auth")
+def auth_state():
+    return {"auth_required": auth.auth_enabled()}
+
+
+@app.middleware("http")
+async def _require_auth(request, call_next):
+    path = request.url.path
+    if path.startswith("/api/") and path not in ("/api/login", "/api/auth"):
+        if auth.auth_enabled() and not auth.verify_session(request.cookies.get("session")):
+            return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    return await call_next(request)
 
 
 # ---- request models ---------------------------------------------------
@@ -46,6 +90,7 @@ class AccountIn(BaseModel):
     like_probability: float = 0.6
     retweet_probability: float = 0.4
     active: bool = True
+    proxy_id: Optional[int] = None
 
 
 class AccountPatch(BaseModel):
@@ -62,6 +107,7 @@ class AccountPatch(BaseModel):
     like_probability: Optional[float] = None
     retweet_probability: Optional[float] = None
     active: Optional[bool] = None
+    proxy_id: Optional[int] = None
 
 
 class SettingsIn(BaseModel):
@@ -77,8 +123,37 @@ class SettingsIn(BaseModel):
     min_delay_seconds: Optional[int] = None
     max_delay_seconds: Optional[int] = None
     openai_model: Optional[str] = None
-    openai_system_prompt: Optional[str] = None
+    openai_post_system_prompt: Optional[str] = None
+    openai_reply_system_prompt: Optional[str] = None
     openai_api_key: Optional[str] = None
+
+
+class ProxyIn(BaseModel):
+    name: str = ""        # empty -> db auto-names "proxy N"
+    host: str
+    port: int
+    scheme: str = "http"  # http | socks5
+    username: str = ""
+    password: str = ""
+    active: bool = True
+
+
+class ProxyPatch(BaseModel):
+    name: Optional[str] = None
+    host: Optional[str] = None
+    port: Optional[int] = None
+    scheme: Optional[str] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+    active: Optional[bool] = None
+
+
+class TestProxyIn(BaseModel):
+    host: str
+    port: int
+    scheme: str = "http"
+    username: str = ""
+    password: str = ""
 
 
 # ---- accounts ---------------------------------------------------------
@@ -142,7 +217,7 @@ def replan_account(aid: int):
 @app.get("/api/accounts/{aid}/schedule")
 def account_schedule(aid: int):
     from datetime import datetime
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(db.TZ).strftime("%Y-%m-%d")
     return db.list_account_schedule(aid, today)
 
 
@@ -177,6 +252,12 @@ def account_today(aid: int):
     }
 
 
+@app.get("/api/activity")
+def activity(limit: int = 50):
+    """Newest runs across all accounts — powers the live activity feed."""
+    return db.recent_activity(limit)
+
+
 # ---- settings + status ------------------------------------------------
 
 @app.get("/api/settings")
@@ -207,6 +288,78 @@ def trigger_tick():
 @app.get("/api/status")
 def status():
     return scheduler.status()
+
+
+# ---- proxies ----------------------------------------------------------
+
+@app.get("/api/proxies")
+def list_proxies():
+    return db.list_proxies()
+
+
+@app.get("/api/proxies/log")
+def proxy_log(limit: int = 50):
+    return db.list_proxy_log(limit)
+
+
+@app.post("/api/proxies", status_code=201)
+def create_proxy(body: ProxyIn):
+    pid = db.create_proxy(body.model_dump())
+    return db.get_proxy(pid)
+
+
+@app.post("/api/proxies/test")
+def test_proxy(body: TestProxyIn):
+    """Live diagnostic via Playwright (HTTP + HTTPS), WITHOUT touching the DB. The add
+    form uses this so a proxy is only saved once it actually works."""
+    results, ms = proxy.diagnose_proxy(
+        body.host, body.port, body.username, body.password, body.scheme
+    )
+    ip = next((r["ip"] for r in results if r["ok"]), "")
+    return {"alive": any(r["ok"] for r in results), "ip": ip, "ms": ms,
+            "results": results}
+
+
+@app.put("/api/proxies/{pid}")
+def update_proxy(pid: int, body: ProxyPatch):
+    if not db.get_proxy(pid):
+        raise HTTPException(404, "proxy not found")
+    db.update_proxy(pid, body.model_dump(exclude_none=True))
+    return db.get_proxy(pid)
+
+
+@app.delete("/api/proxies/{pid}")
+def delete_proxy(pid: int):
+    db.delete_proxy(pid)
+    return {"ok": True}
+
+
+@app.post("/api/proxies/{pid}/check")
+def check_proxy(pid: int):
+    """Health-check a saved proxy via Playwright: alive + exit IP, persisted to the log.
+
+    Sync (`def`) route -> Starlette runs it in a threadpool, so the blocking browser
+    work can't stall the event loop."""
+    p = db.get_proxy(pid, decrypt=True)
+    if not p:
+        raise HTTPException(404, "proxy not found")
+    scheme = p.get("scheme") or "http"
+    results, ms = proxy.diagnose_proxy(
+        p["host"], p["port"], p.get("username", ""), p.get("password", ""), scheme
+    )
+    https = next((r for r in results if r["target"] == "HTTPS"), {})
+    alive = bool(https.get("ok"))         # the bot needs HTTPS — that's the real verdict
+    ip = https.get("ip", "")
+    error = https.get("error", "")
+    detail = "\n".join(
+        f"{r['target']}: {'OK ' + r['ip'] if r['ok'] else 'FAIL'} ({r['ms']}ms)"
+        + (f" — {r['error']}" if r["error"] else "")
+        for r in results
+    )
+    db.record_proxy_check(pid, alive, ip, error, scheme if alive else "", detail, ms,
+                          p.get("name", ""))
+    return {"alive": alive, "ip": ip, "error": error, "scheme": scheme,
+            "ms": ms, "detail": detail, "results": results}
 
 
 # ---- static frontend (production) ------------------------------------

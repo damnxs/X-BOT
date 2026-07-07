@@ -2,6 +2,7 @@
 config.yaml
 data/
 logs/
+run.txt
 web/node_modules/
 web/dist/
 

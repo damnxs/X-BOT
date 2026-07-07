@@ -24,10 +24,31 @@ DEFAULT_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
+def _browser_context(browser, account):
+    """Playwright context with the account's bound SOCKS proxy applied (if any)."""
+    ctx_kwargs = dict(user_agent=DEFAULT_USER_AGENT, viewport={"width": 1280, "height": 900})
+    if account.get("proxy"):
+        ctx_kwargs["proxy"] = account["proxy"]
+    return browser.new_context(**ctx_kwargs)
+
+
+def _capture_exit_ip(page):
+    """Exit IP this browser session egresses through (via its proxy). Best-effort:
+    never blocks the run on failure. Only called when a proxy is set, so the
+    server's real IP is never exposed for direct (proxy-less) runs."""
+    try:
+        resp = page.goto("http://api.ipify.org", timeout=8000, wait_until="domcontentloaded")
+        body = (resp.text() if resp else "").strip()
+        return body if body and len(body) < 45 and any(c.isdigit() for c in body) else ""
+    except Exception:
+        return ""
+
+
 DEFAULT_SETTINGS = {
     "openai_api_key": "",
     "openai_model": "gpt-4o-mini",
-    "openai_system_prompt": "You write short, friendly, on-topic X/Twitter messages. No quote marks.",
+    "openai_post_system_prompt": "",
+    "openai_reply_system_prompt": "",
     "min_delay_seconds": 30,
     "max_delay_seconds": 90,
 }
@@ -112,7 +133,8 @@ def execute_run(account, settings=None, log_dir="logs"):
         llm = LLM({
             "api_key": settings["openai_api_key"],
             "model": settings.get("openai_model", "gpt-4o-mini"),
-            "system_prompt": settings.get("openai_system_prompt"),
+            "post_system": settings.get("openai_post_system_prompt"),
+            "reply_system": settings.get("openai_reply_system_prompt"),
         })
         log.info("OpenAI key present — posting available")
     else:
@@ -125,10 +147,9 @@ def execute_run(account, settings=None, log_dir="logs"):
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless, slow_mo=slow_mo)
-        context = browser.new_context(
-            user_agent=DEFAULT_USER_AGENT, viewport={"width": 1280, "height": 900}
-        )
+        context = _browser_context(browser, account)
         page = context.new_page()
+        exit_ip = _capture_exit_ip(page) if account.get("proxy") else ""
         session = XSession(page, action_log, account.get("username", ""), dry_run)
         try:
             logged_in = bool(session.login(account["auth_token"], account["ct0"]).get("logged_in"))
@@ -143,10 +164,10 @@ def execute_run(account, settings=None, log_dir="logs"):
 
     _save_seen(log_dir, seen)
     summary = {"action": "summary", "mode": mode, "dry_run": dry_run,
-               "counts": counts, "seen_total": len(seen)}
+               "counts": counts, "seen_total": len(seen), "exit_ip": exit_ip}
     action_log.record(**summary)
     log.info("summary: %s", json.dumps(summary))
-    return {"logged_in": logged_in, "counts": counts, "run_log": run_log}
+    return {"logged_in": logged_in, "counts": counts, "run_log": run_log, "exit_ip": exit_ip}
 
 
 def _run_posts(session, llm, action_log, counts, max_posts, keywords, settings, log):
@@ -274,7 +295,8 @@ def execute_action(account, action_type, settings=None, log_dir="logs"):
     llm = LLM({
         "api_key": settings["openai_api_key"],
         "model": settings.get("openai_model", "gpt-4o-mini"),
-        "system_prompt": settings.get("openai_system_prompt"),
+        "post_system": settings.get("openai_post_system_prompt"),
+        "reply_system": settings.get("openai_reply_system_prompt"),
     }) if settings.get("openai_api_key") else None
 
     counts = {}
@@ -283,10 +305,9 @@ def execute_action(account, action_type, settings=None, log_dir="logs"):
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless, slow_mo=slow_mo)
-        context = browser.new_context(
-            user_agent=DEFAULT_USER_AGENT, viewport={"width": 1280, "height": 900}
-        )
+        context = _browser_context(browser, account)
         page = context.new_page()
+        exit_ip = _capture_exit_ip(page) if account.get("proxy") else ""
         session = XSession(page, action_log, account.get("username", ""), dry_run)
         try:
             logged_in = bool(session.login(account["auth_token"], account["ct0"]).get("logged_in"))
@@ -367,7 +388,8 @@ def execute_action(account, action_type, settings=None, log_dir="logs"):
             browser.close()
 
     summary = {"action": "action_summary", "action_type": action_type,
-               "dry_run": dry_run, "counts": counts, "status": status}
+               "dry_run": dry_run, "counts": counts, "status": status, "exit_ip": exit_ip}
     action_log.record(**summary)
     log.info("action %s done: %s", action_type, summary)
-    return {"logged_in": logged_in, "status": status, "counts": counts, "run_log": run_log}
+    return {"logged_in": logged_in, "status": status, "counts": counts,
+            "run_log": run_log, "exit_ip": exit_ip}

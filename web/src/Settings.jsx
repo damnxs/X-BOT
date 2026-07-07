@@ -28,7 +28,8 @@ export default function Settings() {
       min_delay_seconds: +s.min_delay_seconds,
       max_delay_seconds: +s.max_delay_seconds,
       openai_model: s.openai_model,
-      openai_system_prompt: s.openai_system_prompt,
+      openai_post_system_prompt: s.openai_post_system_prompt,
+      openai_reply_system_prompt: s.openai_reply_system_prompt,
     };
     if (s.openai_api_key) body.openai_api_key = s.openai_api_key;
     try {
@@ -42,7 +43,7 @@ export default function Settings() {
 
   return (
     <div className="settings">
-      <h3>Global settings</h3>
+      <h3>global settings</h3>
       <div className="grid2">
         <Field label="Day window start (hour 0-24)"><input value={s.day_start_hour} onChange={(e) => set('day_start_hour', e.target.value)} /></Field>
         <Field label="Day window end (hour 0-24)"><input value={s.day_end_hour} onChange={(e) => set('day_end_hour', e.target.value)} /></Field>
@@ -57,16 +58,17 @@ export default function Settings() {
         <label className="check"><input type="checkbox" checked={boolVal(s.schedule_active)} onChange={(e) => set('schedule_active', e.target.checked)} /> Schedule active (auto-run on interval)</label>
       </div>
 
-      <h3>OpenAI (for posting — optional)</h3>
+      <h3>openai · optional, for posting</h3>
       <Field label="Model"><input value={s.openai_model} onChange={(e) => set('openai_model', e.target.value)} /></Field>
-      <Field label="System prompt"><textarea rows={2} value={s.openai_system_prompt} onChange={(e) => set('openai_system_prompt', e.target.value)} /></Field>
+      <Field label="System prompt · Post"><textarea rows={2} value={s.openai_post_system_prompt} onChange={(e) => set('openai_post_system_prompt', e.target.value)} /></Field>
+      <Field label="System prompt · Reply"><textarea rows={2} value={s.openai_reply_system_prompt} onChange={(e) => set('openai_reply_system_prompt', e.target.value)} /></Field>
       <Field label={s.openai_api_key_set ? 'API key (set — leave blank to keep)' : 'API key (not set — posts disabled)'}>
         <input type="password" value={s.openai_api_key || ''} placeholder="sk-..." onChange={(e) => set('openai_api_key', e.target.value)} />
       </Field>
 
       <div className="row">
-        <button onClick={save}>Save settings</button>
-        <button onClick={() => api.triggerTick().then(() => setMsg('schedule round queued')).catch((e) => setMsg(String(e)))}>Run schedule now</button>
+        <button onClick={save}>save</button>
+        <button onClick={() => api.triggerTick().then(() => setMsg('schedule round queued')).catch((e) => setMsg(String(e)))}>run schedule</button>
         {msg && <span>{msg}</span>}
       </div>
     </div>

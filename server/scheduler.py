@@ -35,7 +35,7 @@ _current = {"account_id": None, "name": None, "action": None, "trigger": None}
 
 
 def _today():
-    return datetime.now().strftime("%Y-%m-%d")
+    return datetime.now(db.TZ).strftime("%Y-%m-%d")
 
 
 def start():
@@ -91,7 +91,7 @@ def _remaining_types(account):
 
 
 def _window_bounds(settings):
-    now = datetime.now()
+    now = datetime.now(db.TZ)
     start_h = float(settings.get("day_start_hour", 0))
     end_h = float(settings.get("day_end_hour", 24))
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -137,7 +137,7 @@ def schedule_next(account):
     if not types:
         return None
     settings = db.get_settings()
-    run_at = datetime.now() + timedelta(seconds=_next_gap_seconds(account, settings))
+    run_at = datetime.now(db.TZ) + timedelta(seconds=_next_gap_seconds(account, settings))
     db.insert_next_if_idle(account["id"], _today(), run_at.isoformat(), random.choice(types))
     return run_at
 
@@ -183,7 +183,7 @@ def _tick(force=False):
     if now >= day_start:
         for acc in db.list_accounts(active_only=True):
             _maybe_start_chain(acc)
-    now_iso = datetime.now().isoformat()
+    now_iso = datetime.now(db.TZ).isoformat()
     for sa in db.due_actions(now_iso):
         db.mark_scheduled(sa["id"], "running")
         enqueue(sa["account_id"], sa["action_type"], "schedule", sa["id"])
@@ -205,6 +205,32 @@ def _worker_loop():
             log.exception("worker error on account %s action %s", account_id, action_type)
 
 
+def _resolve_proxy(proxy_id):
+    """Build a Chromium proxy config from the account's bound proxy, or None.
+
+    Chromium can't authenticate to SOCKS5 (hard browser limit), so an authed
+    SOCKS5 upstream is routed through a local no-auth SOCKS5 bridge (PySocks adds
+    the credentials upstream). HTTP proxies and auth-less SOCKS5 pass straight
+    through."""
+    if not proxy_id:
+        return None
+    p = db.get_proxy(proxy_id, decrypt=True)
+    if not p:
+        return None
+    scheme = (p.get("scheme") or "http").lower()
+    host, port = p["host"], p["port"]
+    user, pw = p.get("username", ""), p.get("password", "")
+    if scheme in ("socks5", "socks5h") and user:
+        from server import socksbridge
+        lp = socksbridge.local_port_for(host, port, user, pw)
+        return {"server": f"socks5://127.0.0.1:{lp}"}
+    cfg = {"server": f"{scheme}://{host}:{port}"}
+    if user:
+        cfg["username"] = user
+        cfg["password"] = pw
+    return cfg
+
+
 def _run_one(account_id, action_type, trigger, sa_id):
     settings = db.get_settings(decrypt=True)
     acc = db.get_account(account_id, decrypt_cookies=True)
@@ -220,8 +246,12 @@ def _run_one(account_id, action_type, trigger, sa_id):
         "headless": settings.get("headless", "1") == "1",
         "slow_mo_ms": 0,
     }
+    proxy = _resolve_proxy(acc.get("proxy_id"))
+    if proxy:
+        account["proxy"] = proxy
+        log.info("account %s -> routing via proxy %s", acc["name"], proxy["server"])
     _current.update(account_id=account_id, name=acc["name"], action=action_type, trigger=trigger)
-    started = datetime.now().isoformat(timespec="seconds")
+    started = datetime.now(db.TZ).isoformat(timespec="seconds")
     run_status, counts, run_log = "ok", {}, None
     try:
         result = execute_action(account, action_type, settings, log_dir=f"logs/{account_id}")
@@ -237,8 +267,8 @@ def _run_one(account_id, action_type, trigger, sa_id):
     # record run, then mark the just-run entry done BEFORE scheduling next —
     # otherwise the still-'running' row blocks insert_next_if_idle and the next
     # tick kicks off a near-now action (actions would fire every ~1 min).
-    rid = db.record_run(account_id, started, datetime.now().isoformat(timespec="seconds"),
-                        run_status, counts, run_log, trigger)
+    rid = db.record_run(account_id, started, datetime.now(db.TZ).isoformat(timespec="seconds"),
+                        run_status, counts, run_log, trigger, result.get("exit_ip", ""))
     if sa_id:
         db.mark_scheduled(sa_id, "done" if run_status == "ok" else "error", rid)
     acc_fresh = db.get_account(account_id)  # latest quotas

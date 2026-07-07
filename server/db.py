@@ -4,10 +4,19 @@ import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from server import crypto
 
-DB_PATH = os.path.join("data", "bot.db")
+# Single source of truth for time: everything (scheduling, run timestamps, daily
+# reset) is Asia/Jakarta so the UI shows consistent GMT+7 regardless of server tz.
+TZ = ZoneInfo("Asia/Jakarta")
+
+# ponytail: anchor to repo root (parent of server/) so the same DB is used no
+# matter which cwd the server is launched from — otherwise a fresh empty
+# data/bot.db appears elsewhere and accounts look "lost" across restarts.
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DB_PATH = os.path.join(_ROOT, "data", "bot.db")
 
 DEFAULT_SETTINGS = {
     "schedule_active": "1",
@@ -22,7 +31,14 @@ DEFAULT_SETTINGS = {
     "min_delay_seconds": "30",
     "max_delay_seconds": "90",
     "openai_model": "gpt-4o-mini",
-    "openai_system_prompt": "You write short, Max 100 character, friendly, on-topic X/Twitter messages. No quote marks. Without emoticon And Without Hastags",
+    "openai_post_system_prompt": (
+        "You write original, engaging X/Twitter posts. Max 100 characters. "
+        "On-topic. No quote marks, no emojis, no hashtags."
+    ),
+    "openai_reply_system_prompt": (
+        "You write short, friendly, relevant X/Twitter replies. Max 100 characters. "
+        "No quote marks, no @mentions, no emojis, no hashtags."
+    ),
     "openai_api_key_enc": "",
 }
 
@@ -42,6 +58,7 @@ CREATE TABLE IF NOT EXISTS accounts (
   like_probability REAL DEFAULT 0.6,
   retweet_probability REAL DEFAULT 0.4,
   active INTEGER DEFAULT 1,
+  proxy_id INTEGER,
   created_at TEXT
 );
 CREATE TABLE IF NOT EXISTS settings (
@@ -57,6 +74,7 @@ CREATE TABLE IF NOT EXISTS runs (
   counts TEXT DEFAULT '{}',
   run_log TEXT,
   trigger TEXT,
+  exit_ip TEXT DEFAULT '',
   FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS scheduled_actions (
@@ -69,6 +87,33 @@ CREATE TABLE IF NOT EXISTS scheduled_actions (
   run_id INTEGER,
   created_at TEXT,
   FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS proxies (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  host TEXT NOT NULL,
+  port INTEGER NOT NULL,
+  scheme TEXT DEFAULT 'socks5',
+  username TEXT DEFAULT '',
+  password_enc BLOB,
+  active INTEGER DEFAULT 1,
+  alive INTEGER DEFAULT 0,
+  last_ip TEXT DEFAULT '',
+  last_checked_at TEXT DEFAULT '',
+  last_error TEXT DEFAULT '',
+  created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS proxy_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  proxy_id INTEGER,
+  proxy_name TEXT,
+  alive INTEGER,
+  ip TEXT,
+  scheme TEXT,
+  error TEXT,
+  detail TEXT,
+  ms INTEGER,
+  checked_at TEXT
 );
 """
 
@@ -89,6 +134,18 @@ def _conn():
 def init_db():
     with _conn() as c:
         c.executescript(SCHEMA)
+        # migration: split the old single openai_system_prompt into post/reply,
+        # preserving any value already saved. Runs before the default-seed loop so a
+        # saved value wins over the new defaults; INSERT OR IGNORE leaves it untouched.
+        old = c.execute(
+            "SELECT value FROM settings WHERE key = 'openai_system_prompt'"
+        ).fetchone()
+        if old and old["value"]:
+            for nk in ("openai_post_system_prompt", "openai_reply_system_prompt"):
+                c.execute(
+                    "INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)",
+                    (nk, old["value"]),
+                )
         for k, v in DEFAULT_SETTINGS.items():
             c.execute(
                 "INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)", (k, v)
@@ -99,6 +156,19 @@ def init_db():
                 c.execute(f"ALTER TABLE accounts ADD COLUMN {col} INTEGER DEFAULT 0")
             except sqlite3.OperationalError:
                 pass  # column already exists
+        # proxy binding (nullable FK -> proxies.id); no default so existing rows stay NULL
+        try:
+            c.execute("ALTER TABLE accounts ADD COLUMN proxy_id INTEGER")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            c.execute("ALTER TABLE proxies ADD COLUMN scheme TEXT DEFAULT 'socks5'")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            c.execute("ALTER TABLE runs ADD COLUMN exit_ip TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
 
 
 # ---- accounts ---------------------------------------------------------
@@ -152,7 +222,7 @@ def create_account(data):
                 float(data.get("like_probability", 0.6)),
                 float(data.get("retweet_probability", 0.4)),
                 int(bool(data.get("active", True))),
-                datetime.now().isoformat(timespec="seconds"),
+                datetime.now(TZ).isoformat(timespec="seconds"),
             ),
         )
         return cur.lastrowid
@@ -165,7 +235,8 @@ def update_account(account_id, data):
                      ("daily_posts", "daily_posts"), ("daily_likes", "daily_likes"),
                      ("daily_retweets", "daily_retweets"), ("daily_replies", "daily_replies"),
                      ("like_probability", "like_probability"),
-                     ("retweet_probability", "retweet_probability")]:
+                     ("retweet_probability", "retweet_probability"),
+                     ("proxy_id", "proxy_id")]:
         if key in data:
             fields.append(f"{col} = ?")
             params.append(data[key])
@@ -219,7 +290,8 @@ def update_settings(data):
     for k in ["schedule_active", "day_start_hour", "day_end_hour",
               "dry_run", "headless", "like_probability", "retweet_probability",
               "reply_min_likes", "reply_max_age_hours",
-              "min_delay_seconds", "max_delay_seconds", "openai_model", "openai_system_prompt"]:
+              "min_delay_seconds", "max_delay_seconds", "openai_model",
+              "openai_post_system_prompt", "openai_reply_system_prompt"]:
         if k in data:
             v = data[k]
             updates[k] = ("1" if v else "0") if k in BOOL_KEYS else str(v)
@@ -234,14 +306,137 @@ def update_settings(data):
             )
 
 
-# ---- runs -------------------------------------------------------------
+# ---- proxies ---------------------------------------------------------
 
-def record_run(account_id, started_at, finished_at, status, counts, run_log, trigger):
+def _row_to_proxy(row, decrypt=False):
+    d = dict(row)
+    enc = d.pop("password_enc", b"") or b""
+    if decrypt:
+        d["password"] = crypto.decrypt(enc)
+    else:
+        d["has_password"] = bool(enc)
+    d["active"] = bool(d.get("active"))
+    d["alive"] = bool(d.get("alive"))
+    return d
+
+
+def list_proxies(decrypt=False):
+    with _conn() as c:
+        rows = c.execute("SELECT * FROM proxies ORDER BY id").fetchall()
+    return [_row_to_proxy(r, decrypt) for r in rows]
+
+
+def get_proxy(proxy_id, decrypt=False):
+    with _conn() as c:
+        row = c.execute("SELECT * FROM proxies WHERE id = ?", (proxy_id,)).fetchone()
+    return _row_to_proxy(row, decrypt) if row else None
+
+
+def _next_proxy_number():
+    """Next auto-number for an unnamed proxy: max existing 'proxy N' + 1 (default 1)."""
+    with _conn() as c:
+        rows = c.execute("SELECT name FROM proxies WHERE name LIKE 'proxy %'").fetchall()
+    nums = []
+    for r in rows:
+        tail = r["name"][len("proxy "):].strip()
+        try:
+            nums.append(int(tail))
+        except ValueError:
+            pass
+    return (max(nums) + 1) if nums else 1
+
+
+def create_proxy(data):
+    name = (data.get("name") or "").strip()
+    if not name:
+        name = f"proxy {_next_proxy_number()}"
     with _conn() as c:
         cur = c.execute(
-            """INSERT INTO runs(account_id, started_at, finished_at, status, counts, run_log, trigger)
-               VALUES (?,?,?,?,?,?,?)""",
-            (account_id, started_at, finished_at, status, json.dumps(counts or {}), run_log, trigger),
+            """INSERT INTO proxies
+               (name, host, port, scheme, username, password_enc, active, created_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                name, data["host"], int(data["port"]),
+                data.get("scheme") or "http",
+                data.get("username", ""),
+                crypto.encrypt(data.get("password", "")),
+                int(bool(data.get("active", True))),
+                datetime.now(TZ).isoformat(timespec="seconds"),
+            ),
+        )
+        return cur.lastrowid
+
+
+def update_proxy(proxy_id, data):
+    fields, params = [], []
+    for key in ("name", "host", "username", "scheme"):
+        if key in data:
+            fields.append(f"{key} = ?")
+            params.append(data[key])
+    if "port" in data:
+        fields.append("port = ?")
+        params.append(int(data["port"]))
+    if "active" in data:
+        fields.append("active = ?")
+        params.append(int(bool(data["active"])))
+    if data.get("password"):           # only overwrite when a new one is supplied
+        fields.append("password_enc = ?")
+        params.append(crypto.encrypt(data["password"]))
+    if not fields:
+        return
+    params.append(proxy_id)
+    with _conn() as c:
+        c.execute(f"UPDATE proxies SET {', '.join(fields)} WHERE id = ?", params)
+
+
+def delete_proxy(proxy_id):
+    with _conn() as c:
+        # unbind any accounts pointing at this proxy before removing it
+        c.execute("UPDATE accounts SET proxy_id = NULL WHERE proxy_id = ?", (proxy_id,))
+        c.execute("DELETE FROM proxies WHERE id = ?", (proxy_id,))
+
+
+def record_proxy_check(proxy_id, alive, ip, error, scheme="", detail="", ms=0, proxy_name=""):
+    now = datetime.now(TZ).isoformat(timespec="seconds")
+    with _conn() as c:
+        # update the proxy's last-known status; only adopt a scheme on a SUCCESS so a
+        # later failed check can't clobber the protocol that last worked.
+        if scheme and alive:
+            c.execute(
+                "UPDATE proxies SET alive=?, last_ip=?, last_error=?, last_checked_at=?, scheme=? "
+                "WHERE id=?",
+                (int(bool(alive)), ip or "", error or "", now, scheme, proxy_id),
+            )
+        else:
+            c.execute(
+                "UPDATE proxies SET alive=?, last_ip=?, last_error=?, last_checked_at=? WHERE id=?",
+                (int(bool(alive)), ip or "", error or "", now, proxy_id),
+            )
+        c.execute(
+            """INSERT INTO proxy_log
+               (proxy_id, proxy_name, alive, ip, scheme, error, detail, ms, checked_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (proxy_id, proxy_name, int(bool(alive)), ip or "", scheme or "",
+             error or "", detail, int(ms or 0), now),
+        )
+
+
+def list_proxy_log(limit=50):
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT * FROM proxy_log ORDER BY id DESC LIMIT ?", (int(limit),)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ---- runs -------------------------------------------------------------
+
+def record_run(account_id, started_at, finished_at, status, counts, run_log, trigger, exit_ip=""):
+    with _conn() as c:
+        cur = c.execute(
+            """INSERT INTO runs(account_id, started_at, finished_at, status, counts, run_log, trigger, exit_ip)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (account_id, started_at, finished_at, status, json.dumps(counts or {}), run_log, trigger, exit_ip or ""),
         )
         return cur.lastrowid
 
@@ -260,9 +455,28 @@ def list_runs(account_id, limit=20):
     return out
 
 
+def recent_activity(limit=50):
+    """Newest runs across ALL accounts — backs the live activity feed."""
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT r.id, r.account_id, a.name AS account_name,
+                      r.started_at, r.finished_at, r.status, r.counts, r.trigger, r.exit_ip
+               FROM runs r
+               LEFT JOIN accounts a ON a.id = r.account_id
+               ORDER BY r.id DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["counts"] = json.loads(d.get("counts") or "{}")
+        out.append(d)
+    return out
+
+
 def todays_counts(account_id):
     """Sum of successful post/like/retweet counts for this account since local midnight."""
-    midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    midnight = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     totals = {"posts": 0, "likes": 0, "retweets": 0, "replies": 0}
     with _conn() as c:
         rows = c.execute(
@@ -302,7 +516,7 @@ def insert_scheduled(account_id, date_str, run_at, action_type):
         c.execute(
             "INSERT INTO scheduled_actions(account_id, date, run_at, action_type, status, created_at) "
             "VALUES (?,?,?,?, 'pending', ?)",
-            (account_id, date_str, run_at, action_type, datetime.now().isoformat(timespec="seconds")),
+            (account_id, date_str, run_at, action_type, datetime.now(TZ).isoformat(timespec="seconds")),
         )
 
 
@@ -324,7 +538,7 @@ def insert_next_if_idle(account_id, date_str, run_at, action_type):
         c.execute(
             "INSERT INTO scheduled_actions(account_id, date, run_at, action_type, status, created_at) "
             "VALUES (?,?,?,?, 'pending', ?)",
-            (account_id, date_str, run_at, action_type, datetime.now().isoformat(timespec="seconds")),
+            (account_id, date_str, run_at, action_type, datetime.now(TZ).isoformat(timespec="seconds")),
         )
         return True
 

@@ -12,7 +12,10 @@ import os
 
 from cryptography.fernet import Fernet
 
-_KEY_FILE = os.path.join("data", "master.key")
+# ponytail: anchor to repo root — see server/db.py. Keeps the master key stable
+# across restarts/cwds so encrypted cookies always decrypt.
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_KEY_FILE = os.path.join(_ROOT, "data", "master.key")
 _fernet = None
 
 
@@ -20,7 +23,7 @@ def _load_or_create_key() -> bytes:
     env = os.environ.get("XBOT_MASTER_KEY")
     if env:
         return env.encode() if isinstance(env, str) else env
-    os.makedirs("data", exist_ok=True)
+    os.makedirs(os.path.join(_ROOT, "data"), exist_ok=True)
     if os.path.exists(_KEY_FILE):
         with open(_KEY_FILE, "rb") as f:
             return f.read()
