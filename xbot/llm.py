@@ -43,15 +43,13 @@ class LLM:
         return {"prompt": user_prompt, "output": text, "tokens": tokens}
 
     def generate_post(self, topic=None):
-        if topic:
-            prompt = f"Write one original, engaging tweet (max {_MAX_CHARS} chars) about: {topic}."
-        else:
-            prompt = f"Write one original, engaging tweet (max {_MAX_CHARS} chars)."
-        return self._chat(prompt, self.post_system)
+        # the system prompt (from Settings) holds ALL the instructions — the user
+        # message is just the topic (or empty). No hardcoded rules that could
+        # conflict with a custom system prompt.
+        return self._chat(topic or "Write a post.", self.post_system)
 
     def generate_reply(self, tweet_text):
-        prompt = (
-            f"Write a short, friendly, relevant reply (max {_MAX_CHARS} chars) to this tweet. "
-            f"No quote marks, no @mentions:\n\n\"{tweet_text}\""
-        )
-        return self._chat(prompt, self.reply_system)
+        # the system prompt (from Settings) holds ALL the instructions — the user
+        # message is just the tweet text to reply to. No hardcoded rules that could
+        # conflict with a custom system prompt.
+        return self._chat(tweet_text, self.reply_system)
