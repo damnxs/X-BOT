@@ -15,25 +15,26 @@ from datetime import datetime, timedelta, timezone
 
 from playwright.sync_api import sync_playwright
 
+from xbot import fingerprint
 from xbot.llm import LLM
 from xbot.log import ActionLog, setup_logging
 from xbot.session import XSession
 from xbot.dryrun import DryRunLogger
 
-DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
-
 # Chromium refuses to start as root with the sandbox on (systemd service runs as root)
 LAUNCH_ARGS = ["--no-sandbox"] if os.geteuid() == 0 else []
 
-def _browser_context(browser, account):
-    """Playwright context. The proxy is applied at browser LAUNCH (chromium.launch
-    proxy=) — that's where Chromium reliably honors SOCKS5; setting it on the
-    context is unreliable for SOCKS and can silently fall back to direct."""
-    ctx_kwargs = dict(user_agent=DEFAULT_USER_AGENT, viewport={"width": 1280, "height": 900})
-    return browser.new_context(**ctx_kwargs)
+def _browser_context(browser, account, log_dir):
+    """Playwright context with the account's PERMANENT fingerprint — generated
+    once into <log_dir>/fingerprint.json and reused every session, distinct per
+    account (see xbot/fingerprint.py). The proxy is applied at browser LAUNCH
+    (chromium.launch proxy=) — that's where Chromium reliably honors SOCKS5;
+    setting it on the context is unreliable for SOCKS and can silently fall
+    back to direct."""
+    fp = fingerprint.load_or_create(log_dir)
+    ctx = browser.new_context(**fingerprint.context_kwargs(fp))
+    ctx.add_init_script(fingerprint.init_script(fp))
+    return ctx
 
 
 _IP_ECHOES = ("https://api.ipify.org", "https://ifconfig.me/ip", "http://api.ipify.org")
@@ -202,7 +203,7 @@ def execute_run(account, settings=None, log_dir="logs"):
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless, slow_mo=slow_mo, proxy=account.get("proxy"), args=LAUNCH_ARGS)
-        context = _browser_context(browser, account)
+        context = _browser_context(browser, account, log_dir)
         page = context.new_page()
         exit_ip = _capture_exit_ip(page) if account.get("proxy") else ""
         session = XSession(page, action_log, account.get("username", ""), dry_run, dry_log=dry_log)
@@ -391,7 +392,7 @@ def execute_action(account, action_type, settings=None, log_dir="logs"):
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless, slow_mo=slow_mo, proxy=account.get("proxy"), args=LAUNCH_ARGS)
-        context = _browser_context(browser, account)
+        context = _browser_context(browser, account, log_dir)
         page = context.new_page()
         exit_ip = _capture_exit_ip(page) if account.get("proxy") else ""
         session = XSession(page, action_log, account.get("username", ""), dry_run, dry_log=dry_log)
@@ -537,7 +538,7 @@ def execute_raid(account, tweet_id, action, reply_text="", settings=None, log_di
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless, slow_mo=slow_mo, proxy=account.get("proxy"), args=LAUNCH_ARGS)
-        context = _browser_context(browser, account)
+        context = _browser_context(browser, account, log_dir)
         page = context.new_page()
         session = XSession(page, action_log, account.get("username", ""), dry_run, dry_log=dry_log)
         try:
@@ -758,7 +759,7 @@ def execute_autoreply(account, cfg, processed_ids, max_replies, settings=None, l
         browser = p.chromium.launch(headless=account.get("headless", True),
                                     slow_mo=account.get("slow_mo_ms", 0),
                                     proxy=account.get("proxy"), args=LAUNCH_ARGS)
-        context = _browser_context(browser, account)
+        context = _browser_context(browser, account, log_dir)
         page = context.new_page()
         session = XSession(page, action_log, account.get("username", ""), dry_run, dry_log=dry_log)
         try:
