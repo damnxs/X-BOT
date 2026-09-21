@@ -38,20 +38,32 @@ function RaidCard({ r, now }) {
       <div className="raidcard-head" onClick={() => setOpen((o) => !o)} role="button" tabIndex={0}
            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setOpen((o) => !o); } }}>
         <span className={`raidcard-dot ${st.cls}`} />
-        <span className={`raidcard-status ${st.cls}`}>{st.label}</span>
+        <span className="raidcard-id">#{r.id}</span>
+        <span className="raidcard-kind">{r.kind === 'mass' ? 'mass' : 'single'}</span>
         <span className="raidcard-time">{r.status === 'running' ? `started ${relTime(r.started_at, now)}` : relTime(r.finished_at || r.started_at, now)}</span>
+        <span className={`raidcard-status ${st.cls}`}>{st.label}</span>
         <span className="raidcard-caret">{open ? '▾' : '▸'}</span>
-      </div>
-
-      <div className="raidcard-meta">
-        {r.kind === 'mass' ? 'Mass Raid' : 'Single Raid'}{parts.length ? ` • ${parts.join(' • ')}` : ''}{accounts.length ? ` • ${accounts.length} account${accounts.length === 1 ? '' : 's'}` : ''}
       </div>
 
       {r.status === 'running' && reqActions.length > 0 && (
         <div className="raidcard-progress">
-          {reqActions.map((k) => (
-            <span key={k} className="raidcard-prog-item">{ACT_LABEL[k]} <b>{(sum[k] || {}).ok || 0}</b>/{req[k]}</span>
-          ))}
+          {reqActions.map((k) => {
+            const ok = (sum[k] || {}).ok || 0;
+            const pct = req[k] ? Math.min(100, (ok / req[k]) * 100) : 0;
+            return (
+              <div key={k} className="rprog">
+                <span className="rprog-label">{ACT_LABEL[k]}</span>
+                <span className="rprog-bar"><span style={{ width: pct + '%' }} /></span>
+                <span className="rprog-val">{ok}/{req[k]}</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {r.status !== 'running' && (parts.length > 0 || accounts.length > 0) && (
+        <div className="raidcard-meta">
+          {parts.join(' · ')}{accounts.length ? `${parts.length ? ' · ' : ''}${accounts.length} acct${accounts.length === 1 ? '' : 's'}` : ''}
         </div>
       )}
 
@@ -64,21 +76,26 @@ function RaidCard({ r, now }) {
 
       {open && (
         <div className="raidcard-body">
-          <div className="raidcard-grid">
-            <div><span className="raidcard-k">Tweet ID</span><div className="raidcard-v">{r.tweet_id}</div></div>
-            <div><span className="raidcard-k">Status</span><div className={`raidcard-v ${st.cls}`}>{st.label}</div></div>
+          <div><span className="feed-ctx-label">context</span>
+            <div className="feed-ctx-grid">
+              <div className="feed-ctx"><span className="feed-ctx-k">raid</span><span className="feed-ctx-v">#{r.id} · {r.kind}</span></div>
+              <div className="feed-ctx"><span className="feed-ctx-k">tweet</span><span className="feed-ctx-v" title={r.tweet_id}>{r.tweet_id}</span></div>
+              <div className="feed-ctx"><span className="feed-ctx-k">started</span><span className="feed-ctx-v">{fmtClock(r.started_at)}</span></div>
+              <div className="feed-ctx"><span className="feed-ctx-k">status</span><span className={`feed-ctx-v ${st.cls}`}>{st.label}</span></div>
+            </div>
           </div>
-          <div className="raidcard-sub">Summary</div>
-          <div className="raidcard-summary">
-            {['like', 'retweet', 'reply'].map((k) => (
-              <div key={k} className={(sum[k] || {}).fail ? 'err' : 'ok'}>
-                <span className="raidcard-mark">{(sum[k] || {}).fail ? '✕' : '✓'}</span> {ACT_LABEL[k]}: {(sum[k] || {}).ok || 0}/{req[k] || 0}
-              </div>
-            ))}
+          <div><span className="feed-ctx-label">summary</span>
+            <div className="raidcard-summary">
+              {['like', 'retweet', 'reply'].map((k) => (
+                <div key={k} className={(sum[k] || {}).fail ? 'err' : 'ok'}>
+                  <span className="raidcard-mark">{(sum[k] || {}).fail ? '✕' : '✓'}</span> {ACT_LABEL[k]}: {(sum[k] || {}).ok || 0}/{req[k] || 0}
+                </div>
+              ))}
+            </div>
           </div>
           {(r.failed || []).length > 0 && (
             <>
-              <div className="raidcard-sub err">Failed Accounts</div>
+              <div className="feed-ctx-label err">failed accounts</div>
               <div className="raidcard-failed">
                 {r.failed.map((f, i) => (
                   <div key={i} className="raidcard-failed-row"><span>@{f.username}</span><span className="muted">{f.message || 'failed'}</span></div>
@@ -107,7 +124,7 @@ export default function RaidActivity() {
     <section className="px-card raid-activity">
       <div className="px-section-head">
         live activity<span className="px-line" />
-        {items && <span className="px-count">{items.length} raid{items.length === 1 ? '' : 's'}</span>}
+        <span className="live"><span className="live-dot" />live</span>
       </div>
       {items && items.length === 0 ? (
         <p className="muted raid-empty">no raids yet — run a single or mass raid to see history here.</p>

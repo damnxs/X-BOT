@@ -29,6 +29,8 @@ DEFAULT_SETTINGS = {
     "reply_min_likes": "50",
     "min_delay_seconds": "30",
     "max_delay_seconds": "90",
+    "raid_independent": "1",   # raids run immediately alongside warm-up
+    "raid_step_gap": "0",      # extra seconds between raid steps (0 = none)
     "openai_model": "gpt-4o-mini",
     "openai_post_system_prompt": (
         "You write original, engaging X/Twitter posts. Max 100 characters. "
@@ -385,13 +387,14 @@ def get_settings(decrypt=False):
 def update_settings(data):
     # Booleans must be stored as "1"/"0": str(True) -> "True" would later fail
     # the `== "1"` checks in the scheduler and the frontend's boolVal().
-    BOOL_KEYS = {"dry_run", "headless", "schedule_active"}
+    BOOL_KEYS = {"dry_run", "headless", "schedule_active", "raid_independent"}
     updates = {}
     for k in ["schedule_active", "day_start_hour", "day_end_hour",
               "dry_run", "headless", "like_probability", "retweet_probability",
               "reply_min_likes",
               "min_delay_seconds", "max_delay_seconds", "openai_model",
-              "openai_post_system_prompt", "openai_reply_system_prompt"]:
+              "openai_post_system_prompt", "openai_reply_system_prompt",
+              "raid_independent", "raid_step_gap"]:
         if k in data:
             v = data[k]
             updates[k] = ("1" if v else "0") if k in BOOL_KEYS else str(v)
@@ -849,6 +852,16 @@ def mark_scheduled(sa_id, status, run_id=None):
         c.execute(
             "UPDATE scheduled_actions SET status = ?, run_id = ? WHERE id = ?",
             (status, run_id, sa_id),
+        )
+
+
+def push_scheduled(sa_id, run_at):
+    """Put a 'running' scheduled action back to pending at a later time
+    (used to defer a warm-up action while a raid holds the account)."""
+    with _conn() as c:
+        c.execute(
+            "UPDATE scheduled_actions SET status = 'pending', run_at = ? WHERE id = ?",
+            (run_at, sa_id),
         )
 
 

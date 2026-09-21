@@ -130,6 +130,8 @@ class SettingsIn(BaseModel):
     retweet_probability: Optional[float] = None
     min_delay_seconds: Optional[int] = None
     max_delay_seconds: Optional[int] = None
+    raid_independent: Optional[bool] = None   # raids run immediately, warm-up unaffected
+    raid_step_gap: Optional[int] = None       # extra seconds between raid steps
     openai_model: Optional[str] = None
     openai_post_system_prompt: Optional[str] = None
     openai_reply_system_prompt: Optional[str] = None

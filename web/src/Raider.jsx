@@ -52,13 +52,17 @@ export default function Raider() {
   const [q, setQ] = useState('');
   const [statusF, setStatusF] = useState('any');
   const [now, setNow] = useState(Date.now());
+  const [stepGap, setStepGap] = useState(0); // settings: raid_step_gap seconds
   const allRef = useRef(null);
   const { act, has } = useActions();
   const toast = useToast();
 
   useEffect(() => {
-    Promise.all([api.accounts(), api.accountActivity()])
-      .then(([accs, act]) => setAccounts(accs.map((a) => ({ ...a, last_activity: act[a.id] || null }))))
+    Promise.all([api.accounts(), api.accountActivity(), api.settings()])
+      .then(([accs, act, st]) => {
+        setAccounts(accs.map((a) => ({ ...a, last_activity: act[a.id] || null })));
+        setStepGap(Math.max(0, +st.raid_step_gap || 0));
+      })
       .catch((e) => toast.error(errorMsg(e)));
   }, [toast]);
   // keep "X Min Ago" fresh while the page sits open
@@ -100,7 +104,8 @@ export default function Raider() {
     if (ids.length === 0) { toast.error('Select at least one account.'); return; }
     if (action === 'reply' && !replyText.trim()) { toast.error('Reply text is required.'); return; }
     setResults(Object.fromEntries(ids.map((a) => [a.id, { status: 'queued' }])));
-    for (const a of ids) {
+    for (let i = 0; i < ids.length; i++) {
+      const a = ids[i];
       setResults((p) => ({ ...p, [a.id]: { status: 'running' } }));
       try {
         const r = await api.raidRun({ account_id: a.id, tweet_id: tweetId, action, reply_text: replyText });
@@ -113,12 +118,19 @@ export default function Raider() {
         setResults((p) => ({ ...p, [a.id]: { status: 'error', message: m } }));
         toast.error(`${a.name}: ${m}`);
       }
+      // settings pacing: randomized step gap (±50%) between accounts
+      if (stepGap > 0 && i < ids.length - 1) {
+        await new Promise((r) => setTimeout(r, stepGap * 1000 * (0.5 + Math.random())));
+      }
     }
     toast.success('raid complete');
   });
 
   const canRun = tweetId && ids.length > 0 && (action !== 'reply' || replyText.trim());
   const hasResults = Object.keys(results).length > 0;
+  // raid progress aggregates for the thin bar + header count
+  const raidDone = ids.filter((a) => ['done', 'error'].includes((results[a.id] || {}).status)).length;
+  const raidOk = ids.filter((a) => (results[a.id] || {}).status === 'done').length;
 
   return (
     <div className="app">
@@ -144,18 +156,21 @@ export default function Raider() {
         <>
         {/* target */}
         <section className="px-card">
-          <div className="px-section-head">target post</div>
-          <input
-            className="raid-target"
-            placeholder="paste the X post URL or tweet ID, e.g. https://x.com/Real__Axella/status/2075067079388958992"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-          />
+          <div className="px-section-head">target lock</div>
+          <div className="raid-target-wrap">
+            <span className="raid-target-prompt">»</span>
+            <input
+              className="raid-target"
+              placeholder="paste the X post URL or tweet ID — https://x.com/user/status/2075067079388958992"
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+            />
+          </div>
           {input.trim() && (
             <div className="raid-tweetid">
               {tweetId
-                ? <span className="ok">tweet id: <code>{tweetId}</code></span>
-                : <span className="err">invalid — paste a full X post URL or the numeric tweet ID</span>}
+                ? <span className="ok"><span className="led on" /> locked · <code>{tweetId}</code></span>
+                : <span className="err"><span className="led err" /> invalid — paste a full X post URL or the numeric tweet ID</span>}
             </div>
           )}
         </section>
@@ -183,7 +198,7 @@ export default function Raider() {
             </div>
           </div>
 
-          <div className="table-wrap">
+          <div className="table-wrap raid-acct-scroll">
             <table className="dsh-table raid-tbl">
               <thead>
                 <tr>
@@ -224,8 +239,8 @@ export default function Raider() {
 
         {/* action */}
         <section className="px-card">
-          <div className="px-section-head">action</div>
-          <div className="seg">
+          <div className="px-section-head">payload<span className="px-line" /><span className="px-count">{ids.length} armed</span></div>
+          <div className="seg raid-seg">
             {ACTIONS.map((a) => (
               <button key={a} className={action === a ? 'active' : ''} disabled={running} onClick={() => setAction(a)}>{a}</button>
             ))}
@@ -242,22 +257,28 @@ export default function Raider() {
 
         {/* run + progress */}
         <div className="raid-bar">
-          <span className="raid-count">{ids.length} account(s) · {action}</span>
-          <button className="btn btn-primary" disabled={!canRun || running} onClick={run}>
-            {running && <Spinner />} {running ? 'raiding…' : 'run raid'}
+          <span className="raid-summary">
+            {ids.length} armed × {action}{tweetId ? <span className="raid-summary-id"> → {tweetId}</span> : ''}
+          </span>
+          <button className="btn btn-primary raid-exec" disabled={!canRun || running} onClick={run}>
+            {running && <Spinner />} {running ? 'raiding…' : 'execute ⏎'}
           </button>
         </div>
 
         {(running || hasResults) && (
           <section className="px-card">
-            <div className="px-section-head">progress</div>
+            <div className="px-section-head">
+              progress<span className="px-line" />
+              <span className="px-count">{raidDone}/{ids.length} done · {raidOk} ok</span>
+            </div>
+            <div className="raid-agg"><span style={{ width: ids.length ? `${(raidDone / ids.length) * 100}%` : 0 }} /></div>
             <div className="raid-progress">
               {ids.map((a) => {
                 const r = results[a.id] || { status: 'idle' };
                 return (
-                  <div key={a.id} className="raid-row">
+                  <div key={a.id} className={`raid-row ${r.status}`}>
                     <span className="raid-row-name">{a.name} <span className="raid-acct-handle">@{a.username}</span></span>
-                    {r.exit_ip && <span className="raid-row-msg" title="exit IP">{r.exit_ip}</span>}
+                    {r.exit_ip && <span className="raid-row-ip" title="exit IP">{r.exit_ip}</span>}
                     {r.message && r.status === 'error' && <span className="raid-row-msg err" title={r.message}>{r.message}</span>}
                     <span className={`raid-status ${r.status}`}>
                       <span className="raid-status-dot" />{STATUS_LABEL[r.status] || r.status}

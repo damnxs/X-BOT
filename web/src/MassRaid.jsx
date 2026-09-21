@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { api } from './api.js';
 import { useActions, useToast, Spinner, errorMsg } from './toast.jsx';
 
@@ -22,8 +22,11 @@ export default function MassRaid() {
   const [plan, setPlan] = useState(null);
   const [log, setLog] = useState([]);
   const [stats, setStats] = useState(null);
+  const [stepGap, setStepGap] = useState(0); // settings: raid_step_gap seconds
   const { act, has } = useActions();
   const toast = useToast();
+
+  useEffect(() => { api.settings().then((s) => setStepGap(Math.max(0, +s.raid_step_gap || 0))).catch(() => {}); }, []);
 
   const tweetId = parseTweetId(input);
   const planning = has('plan');
@@ -51,7 +54,8 @@ export default function MassRaid() {
     const t0 = Date.now();
     const start = await api.massStart({ tweet_id: tweetId, likes: counts.like, retweets: counts.retweet, replies: counts.reply });
     const raidId = start.raid_id;
-    for (const step of steps) {
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i];
       const entry = { key: `${step.account_id}-${step.action}-${Math.random().toString(36).slice(2, 7)}`,
                       name: step.name, username: step.username, action: step.action, result: 'running', message: '', ts: Date.now() };
       setLog((l) => [...l, entry]);   // show the step as "waiting…" while the pre-action delay runs
@@ -66,6 +70,10 @@ export default function MassRaid() {
         setStats((p) => { const n = { ...p }; n[step.action].fail++; return n; });
         setLog((l) => l.map((e) => e.key === entry.key ? { ...e, result: 'error', message: m, ts: Date.now() } : e));
         toast.error(`${step.name}: ${m}`);
+      }
+      // settings pacing: randomized step gap (±50%) between accounts
+      if (stepGap > 0 && i < steps.length - 1) {
+        await new Promise((r) => setTimeout(r, stepGap * 1000 * (0.5 + Math.random())));
       }
     }
     await api.massFinish({ raid_id: raidId, status: 'completed' });

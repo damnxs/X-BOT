@@ -15,7 +15,7 @@ export const fmtJakarta = (iso) => (iso
 const empty = {
   name: '', username: '', auth_token: '', ct0: '', keywords: '',
   mode: 'search', daily_posts: 0, daily_likes: 5, daily_retweets: 2, daily_replies: 0,
-  like_probability: 0.6, retweet_probability: 0.4, active: true, proxy_id: null,
+  active: true, proxy_id: null,
   pop_min_likes: 0, pop_min_replies: 0, pop_tab: 'live',
 };
 
@@ -66,17 +66,19 @@ export default function Accounts({ status }) {
     }
     const payload = {
       ...a,
+      name: (a.name || '').trim() || a.username, // blank name -> @username
       keywords: typeof a.keywords === 'string'
         ? a.keywords.split(',').map((s) => s.trim()).filter(Boolean)
         : a.keywords,
       daily_posts: +a.daily_posts, daily_likes: +a.daily_likes, daily_retweets: +a.daily_retweets,
       daily_replies: +a.daily_replies,
-      like_probability: +a.like_probability, retweet_probability: +a.retweet_probability,
       proxy_id: a.proxy_id ? +a.proxy_id : null,
       pop_min_likes: +a.pop_min_likes || 0,
       pop_min_replies: +a.pop_min_replies || 0,
       pop_tab: a.pop_tab || 'live',
     };
+    delete payload.like_probability; // legacy, unused by the scheduler flow
+    delete payload.retweet_probability;
     if (a.id) await api.updateAccount(a.id, payload);
     else await api.createAccount(payload);
     setEditing(null);
@@ -170,10 +172,10 @@ export default function Accounts({ status }) {
                 const dTotal = doneOf(a);
                 const pct = q ? Math.min(100, (dTotal / q) * 100) : 0;
                 const meters = [
-                  { label: 'Posts', done: d.posts, quota: a.daily_posts ?? 0 },
-                  { label: 'Likes', done: d.likes, quota: a.daily_likes ?? 0 },
-                  { label: 'Retweets', done: d.retweets, quota: a.daily_retweets ?? 0 },
-                  { label: 'Replies', done: d.replies ?? 0, quota: a.daily_replies ?? 0 },
+                  { field: 'daily_posts', label: 'Posts', done: d.posts, quota: a.daily_posts ?? 0 },
+                  { field: 'daily_likes', label: 'Likes', done: d.likes, quota: a.daily_likes ?? 0 },
+                  { field: 'daily_retweets', label: 'Retweets', done: d.retweets, quota: a.daily_retweets ?? 0 },
+                  { field: 'daily_replies', label: 'Replies', done: d.replies ?? 0, quota: a.daily_replies ?? 0 },
                 ];
                 return (
                   <Fragment key={a.id}>
@@ -220,20 +222,42 @@ export default function Accounts({ status }) {
                     {open && (
                       <tr className="acct-detail-row">
                         <td colSpan={5}>
-                          <div className="acct-detail">
-                            <div className="acct-detail-head">done today / quota</div>
-                            <div className="meters">
+                          <div className="quota-panel">
+                            <div className="quota-head">
+                              <span className="quota-path">~/warmup/{a.username || 'acct-' + a.id}/quota</span>
+                              <span className="px-line" />
+                              <span className="quota-sum">{dTotal}<em>/{q}</em> today</span>
+                              <span className={`quota-pct${pct >= 100 ? ' full' : ''}`}>{Math.round(pct)}%</span>
+                            </div>
+                            <div className="quota-grid">
                               {meters.map((m) => {
                                 const p = m.quota > 0 ? Math.min(100, (m.done / m.quota) * 100) : 0;
                                 const complete = m.quota > 0 && m.done >= m.quota;
                                 return (
-                                  <div key={m.label} className={`meter${complete ? ' done' : ''}`}>
-                                    <span className="meter-label">{m.label}</span>
-                                    <span className="meter-track"><span className="meter-fill" style={{ width: p + '%' }} /></span>
-                                    <span className="meter-val">{m.done} / {m.quota}</span>
+                                  <div key={m.field} className={`qcard${complete ? ' done' : ''}${!m.quota ? ' off' : ''}`}>
+                                    <div className="qcard-head">
+                                      <span className="qcard-led" />
+                                      <span className="qcard-label">{m.label}</span>
+                                      <span className="qcard-done">{m.done}<em>/{m.quota}</em></span>
+                                    </div>
+                                    <div className="qcard-bar"><span style={{ width: p + '%' }} /></div>
+                                    <div className="qcard-edit">
+                                      <span className="qcard-key">daily</span>
+                                      <QuotaInput account={a} field={m.field} label={m.label} onApply={(n) => act(`quota-${a.id}-${m.field}`, async () => {
+                                        await api.updateAccount(a.id, { [m.field]: n });
+                                        toast.success(`${a.name}: daily ${m.label.toLowerCase()} ${a[m.field] ?? 0} → ${n}`);
+                                        load();
+                                      })} />
+                                      <span className="qcard-key">/day</span>
+                                    </div>
                                   </div>
                                 );
                               })}
+                            </div>
+                            <div className="quota-foot">
+                              <span><kbd>⏎</kbd> apply</span>
+                              <span><kbd>esc</kbd> revert</span>
+                              <span className="muted">quota edits ask for confirmation</span>
                             </div>
                           </div>
                         </td>
@@ -300,66 +324,159 @@ function Field({ label, children }) {
   return <label>{label}{children}</label>;
 }
 
+// ---- daily quota input (expanded account row, quick edit) --------------
+// Type any amount; committing (Enter/blur) asks confirm() first (same
+// pattern as account delete); confirm patches the account in place — the
+// scheduler picks the new quota up on its next tick. Escape reverts.
+function QuotaInput({ account, field, label, onApply }) {
+  const value = account[field] ?? 0;
+  const [draft, setDraft] = useState(String(value));
+  useEffect(() => setDraft(String(value)), [value]); // sync after save/reload
+  const commit = () => {
+    const n = Math.max(0, Math.round(+draft) || 0);
+    if (n === value) return;
+    if (window.confirm(`Change daily ${label.toLowerCase()} for “${account.name}”: ${value} → ${n}?`)) onApply(n);
+    else setDraft(String(value));
+  };
+  return (
+    <input className="quota-input" type="number" min="0" value={draft} title={`${label} per day`}
+           onChange={(e) => setDraft(e.target.value)}
+           onBlur={commit}
+           onKeyDown={(e) => {
+             if (e.key === 'Enter') e.target.blur();
+             if (e.key === 'Escape') { setDraft(String(value)); e.target.blur(); }
+           }} />
+  );
+}
+
+// module-level so React keeps the DOM between renders (a nested component
+// definition would remount the inputs on every keystroke)
+function FormSec({ title, children }) {
+  return (
+    <div className="form-sec">
+      <div className="form-sec-head">{title}</div>
+      {children}
+    </div>
+  );
+}
+
 function AccountForm({ value, onCancel, onSave }) {
   const [a, setA] = useState(value);
   const [proxies, setProxies] = useState([]);
+  const [paste, setPaste] = useState('');
+  const [parsed, setParsed] = useState([]); // valid rows from the paste box
+  const [badLines, setBadLines] = useState(0);
   const { act, has } = useActions();
   const toast = useToast();
   const set = (k, v) => setA((p) => ({ ...p, [k]: v }));
   const num = (k) => (e) => set(k, e.target.value);
   useEffect(() => { api.proxies().then(setProxies).catch(() => {}); }, []);
+
+  // pasted lines of "username,auth_token,ct0" — one account per line
+  const parsePaste = (text) => {
+    setPaste(text);
+    const rows = [];
+    let bad = 0;
+    text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).forEach((line) => {
+      const [username, auth_token, ct0] = line.split(',').map((s) => s.trim());
+      if (username && auth_token && ct0) rows.push({ username, auth_token, ct0 });
+      else bad += 1;
+    });
+    setParsed(rows);
+    setBadLines(bad);
+  };
+
   return (
     <div className="modal">
-      <div className="modal-card">
+      <div className="modal-card add-account">
         <h3>{value.id ? 'Edit account' : 'Add account'}</h3>
-        <Field label="Name"><input value={a.name} onChange={(e) => set('name', e.target.value)} /></Field>
-        <Field label="Username (no @)"><input value={a.username} onChange={(e) => set('username', e.target.value)} /></Field>
-        <Field label={value.id ? 'auth_token (blank = keep)' : 'auth_token'}><input type="password" value={a.auth_token || ''} onChange={(e) => set('auth_token', e.target.value)} /></Field>
-        <Field label={value.id ? 'ct0 (blank = keep)' : 'ct0'}><input type="password" value={a.ct0 || ''} onChange={(e) => set('ct0', e.target.value)} /></Field>
-        <Field label="Keywords (comma-separated)"><input value={a.keywords} onChange={(e) => set('keywords', e.target.value)} /></Field>
-        <Field label="Mode">
-          <select value={a.mode} onChange={(e) => set('mode', e.target.value)}>
-            <option value="search">search</option>
-            <option value="timeline">timeline</option>
-            <option value="search_popularity">search by popularity</option>
-          </select>
-        </Field>
-        {a.mode === 'search_popularity' && (
-          <div className="pop-fields">
-            <div className="grid3">
-              <Field label="Min likes (required)">
-                <input type="number" min="0" value={a.pop_min_likes || ''} onChange={num('pop_min_likes')} placeholder="e.g. 100" />
-              </Field>
-              <Field label="Min replies (optional)">
-                <input type="number" min="0" value={a.pop_min_replies || ''} onChange={num('pop_min_replies')} placeholder="e.g. 10" />
-              </Field>
-              <Field label="Search tab">
-                <select value={a.pop_tab || 'live'} onChange={(e) => set('pop_tab', e.target.value)}>
-                  <option value="live">Latest</option>
-                  <option value="top">Top</option>
-                </select>
-              </Field>
-            </div>
-            <p className="muted pop-hint">Uses X advanced search — <code>min_faves</code>/<code>min_replies</code>. Latest = recent matching tweets; Top = all-time popular.</p>
-          </div>
+
+        {!value.id && (
+          <FormSec title="quick add — paste cookies">
+            <textarea rows="3" spellCheck="false" value={paste}
+                      placeholder={'username,auth_token,ct0 — one account per line'}
+                      onChange={(e) => parsePaste(e.target.value)} />
+            {(parsed.length > 0 || badLines > 0) && (
+              <div className="paste-info">
+                <span className="ok">{parsed.length} valid</span>
+                {badLines > 0 && <span className="err">{badLines} invalid line{badLines > 1 ? 's' : ''}</span>}
+                {parsed.length > 1 && <span className="muted">uses the first line</span>}
+                <button className="btn btn-primary" disabled={!parsed.length} onClick={() => {
+                  const r = parsed[0];
+                  setA((p) => ({ ...p, username: r.username, auth_token: r.auth_token, ct0: r.ct0, name: p.name || r.username }));
+                  toast.info(`form filled from “${r.username}” — review, then create below`);
+                }}>fill form ↓</button>
+              </div>
+            )}
+          </FormSec>
         )}
-        <div className="grid4">
-          <Field label="Daily posts"><input type="number" value={a.daily_posts} onChange={num('daily_posts')} /></Field>
-          <Field label="Daily likes"><input type="number" value={a.daily_likes} onChange={num('daily_likes')} /></Field>
-          <Field label="Daily retweets"><input type="number" value={a.daily_retweets} onChange={num('daily_retweets')} /></Field>
-          <Field label="Daily replies"><input type="number" value={a.daily_replies} onChange={num('daily_replies')} /></Field>
-        </div>
-        <div className="grid2">
-          <Field label="Like prob"><input value={a.like_probability} onChange={num('like_probability')} /></Field>
-          <Field label="Retweet prob"><input value={a.retweet_probability} onChange={num('retweet_probability')} /></Field>
-        </div>
-        <Field label="Proxy">
-          <select value={a.proxy_id ?? ''} onChange={(e) => set('proxy_id', e.target.value || null)}>
-            <option value="">no proxy (local IP)</option>
-            {proxies.map((p) => <option key={p.id} value={p.id}>{p.name} · {p.host}:{p.port}</option>)}
-          </select>
-        </Field>
-        <label className="check"><input type="checkbox" checked={a.active} onChange={(e) => set('active', e.target.checked)} /> Active</label>
+
+        <FormSec title={value.id ? 'credentials (blank = keep)' : 'credentials'}>
+          <Field label="Name"><input value={a.name} placeholder="display name — blank = @username" onChange={(e) => set('name', e.target.value)} /></Field>
+          <Field label="Username (no @)"><input value={a.username} onChange={(e) => set('username', e.target.value)} /></Field>
+          <Field label="auth_token"><input type="password" value={a.auth_token || ''} title="X session cookie: auth_token" onChange={(e) => set('auth_token', e.target.value)} /></Field>
+          <Field label="ct0"><input type="password" value={a.ct0 || ''} title="X session cookie: ct0" onChange={(e) => set('ct0', e.target.value)} /></Field>
+        </FormSec>
+
+        <FormSec title="behavior">
+          <Field label="Mode">
+            <select value={a.mode} onChange={(e) => set('mode', e.target.value)}>
+              <option value="search">search — find tweets by keyword</option>
+              <option value="timeline">timeline — scroll own feed, no keywords</option>
+              <option value="search_popularity">search by popularity — popular tweets only</option>
+            </select>
+          </Field>
+          {a.mode !== 'timeline' ? (
+            <>
+              <Field label="Search keywords (comma-separated)">
+                <input value={a.keywords} placeholder="solana,robinhood,rwa" onChange={(e) => set('keywords', e.target.value)} />
+              </Field>
+              <p className="field-hint">each action picks ONE keyword at random — vary them for a natural feed</p>
+            </>
+          ) : (
+            <p className="field-hint"></p>
+          )}
+          {a.mode === 'search_popularity' && (
+            <div className="pop-fields">
+              <div className="grid3">
+                <Field label="Min likes (required)">
+                  <input type="number" min="0" value={a.pop_min_likes || ''} onChange={num('pop_min_likes')} placeholder="e.g. 100" />
+                </Field>
+                <Field label="Min replies (optional)">
+                  <input type="number" min="0" value={a.pop_min_replies || ''} onChange={num('pop_min_replies')} placeholder="e.g. 10" />
+                </Field>
+                <Field label="Search tab">
+                  <select value={a.pop_tab || 'live'} onChange={(e) => set('pop_tab', e.target.value)}>
+                    <option value="live">Latest</option>
+                    <option value="top">Top</option>
+                  </select>
+                </Field>
+              </div>
+              <p className="field-hint">X advanced search — <code>min_faves</code>/<code>min_replies</code>. Latest = recent popular; Top = all-time popular.</p>
+            </div>
+          )}
+        </FormSec>
+
+        <FormSec title="daily quota — actions per day">
+          <div className="grid4">
+            <Field label="Posts"><input type="number" min="0" value={a.daily_posts} onChange={num('daily_posts')} /></Field>
+            <Field label="Likes"><input type="number" min="0" value={a.daily_likes} onChange={num('daily_likes')} /></Field>
+            <Field label="Retweets"><input type="number" min="0" value={a.daily_retweets} onChange={num('daily_retweets')} /></Field>
+            <Field label="Replies"><input type="number" min="0" value={a.daily_replies} onChange={num('daily_replies')} /></Field>
+          </div>
+          <p className="field-hint"></p>
+        </FormSec>
+
+        <FormSec title="connection">
+          <Field label="Proxy">
+            <select value={a.proxy_id ?? ''} onChange={(e) => set('proxy_id', e.target.value || null)}>
+              <option value="">no proxy (local IP)</option>
+              {proxies.map((p) => <option key={p.id} value={p.id}>{p.name} · {p.host}:{p.port}</option>)}
+            </select>
+          </Field>
+          <label className="check"><input type="checkbox" checked={a.active} onChange={(e) => set('active', e.target.checked)} /> Active — scheduler runs actions for this account</label>
+        </FormSec>
+
         <div className="row">
           <button className="btn btn-primary" disabled={has('save')} onClick={() => act('save', async () => {
             await onSave(a);  // throws on validation/API error -> toast.error

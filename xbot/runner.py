@@ -125,10 +125,13 @@ def _gather_candidates(session, mode, keywords, log, target, pop_min_likes=0, po
     if mode == "timeline":
         candidates = session.timeline(limit=target + 4).get("results", [])
     else:
+        # ONE random keyword per action — each run searches a different topic
+        # instead of always the same wording (and skips a search per keyword)
+        kws = [random.choice(keywords)] if keywords else []
         per_kw = max(6, target + 2)
         # popularity mode uses the account's chosen tab (Top or Latest); plain search is Latest
         tab = (pop_tab or "live") if mode == "search_popularity" else "live"
-        for kw in keywords:
+        for kw in kws:
             q = _pop_query(kw, pop_min_likes, pop_min_replies) if mode == "search_popularity" else kw
             candidates.extend(session.search(q, limit=per_kw, tab=tab).get("results", []))
         # safety net: X's min_faves operator is occasionally loose, so re-check likes
@@ -318,11 +321,13 @@ def _warmup_follows(session, tweet, counts, log, followed):
 
 
 def _first_candidate(session, mode, keywords, seen, log, pop_min_likes=0, pop_min_replies=0, pop_tab="live"):
-    """First tweet from the feed that hasn't been engaged yet."""
-    for c in _gather_candidates(session, mode, keywords, log, 10, pop_min_likes, pop_min_replies, pop_tab):
-        if c["url"] not in seen:
-            return c
-    return None
+    """One RANDOM not-yet-engaged tweet from the gathered pool (timeline: the
+    scrolled home feed, no keywords; search: one random keyword). Random, not
+    the top of the feed — same human-noise rule as the random keyword."""
+    pool = [c for c in _gather_candidates(session, mode, keywords, log, 10, pop_min_likes, pop_min_replies, pop_tab)
+            if c["url"] not in seen]
+    log.info("candidate pool: %d fresh, picking one at random", len(pool))
+    return random.choice(pool) if pool else None
 
 
 def _first_reply_candidate(session, mode, keywords, seen, log, min_likes):
@@ -332,10 +337,20 @@ def _first_reply_candidate(session, mode, keywords, seen, log, min_likes):
     so X returns popular tweets directly — a plain live search surfaces the newest
     tweets, which are usually low-engagement and would all fail a client-side likes
     check. Picks the most-liked of what X returns. Returns None if none."""
+    if mode == "timeline":
+        # home feed, no keywords: random pick among not-yet-replied tweets
+        pool = [c for c in session.timeline(limit=20).get("results", []) if c["url"] not in seen]
+        if not pool:
+            return None
+        pick = random.choice(pool)
+        log.info("reply: %d fresh on feed, picked @%s at random", len(pool), pick.get("author"))
+        return pick
     eligible = []
-    for kw in (keywords or [None]):
+    # one random keyword per reply action — same randomized-topic rule as
+    # like/retweet gathering
+    for kw in ([random.choice(keywords)] if keywords else [None]):
         q = _pop_query(kw, min_likes, 0) if min_likes else kw   # append min_faves:N
-        res = session.timeline(limit=20) if mode == "timeline" else session.search(q, limit=20, tab="live")
+        res = session.search(q, limit=20, tab="live")
         for c in res.get("results", []):
             if c["url"] in seen:
                 continue

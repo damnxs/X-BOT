@@ -35,12 +35,19 @@ _scheduler = None
 _worker_started = False
 _current = {"account_id": None, "name": None, "action": None, "trigger": None}
 _ar_current = {"account_id": None, "name": None, "action": None, "trigger": None}
+_raid_current = {"account_id": None, "name": None, "action": None, "tweet_id": None}
 
 
 def ar_current():
     """What the auto-reply worker is doing right now (None when idle). Kept
     separate from _current so the warm-up status bar never shows autoreply."""
     return dict(_ar_current) if _ar_current["account_id"] else None
+
+
+def raid_current():
+    """What a raid is doing right now (None when idle). Kept separate from
+    _current so raids never clobber the warm-up status display."""
+    return dict(_raid_current) if _raid_current["account_id"] else None
 
 
 def _today():
@@ -177,6 +184,8 @@ def status():
         "schedule_active": active,
         "running": _current["account_id"] is not None,
         "current": dict(_current) if _current["account_id"] else None,
+        "raid_running": _raid_current["account_id"] is not None,
+        "raid_current": dict(_raid_current) if _raid_current["account_id"] else None,
         "queue_depth": len(q),
         "queue": [{"account_id": a, "action": ty, "trigger": tr} for a, ty, tr, _ in q],
         "today_pending": pending,
@@ -270,6 +279,13 @@ def _run_one(account_id, action_type, trigger, sa_id):
         if sa_id:
             db.mark_scheduled(sa_id, "skipped")
         return
+    # an independent raid (or autoreply cycle) holds this account -> slide this
+    # warm-up action +12 min instead of double-running the browser session.
+    # The chain stays alive; other accounts are unaffected.
+    if sa_id and account_id in db.running_account_ids():
+        db.push_scheduled(sa_id, (datetime.now(db.TZ) + timedelta(minutes=12)).isoformat())
+        log.info("account %s busy with a raid/cycle — warm-up action deferred 12 min", account_id)
+        return
     account = {
         "id": acc["id"], "name": acc["name"], "username": acc.get("username", ""),
         "auth_token": acc["auth_token"], "ct0": acc["ct0"],
@@ -332,6 +348,12 @@ def run_raid(account_id, tweet_id, action, reply_text="", raid_id=None):
     is given (mass raid step) the run is linked to that raid; otherwise a single
     raid row is created and finished here."""
     settings = db.get_settings(decrypt=True)
+    if settings.get("raid_independent", "1") != "1":
+        # serialized mode: wait (up to 15 min) until nothing else runs on this
+        # account, so raid + warm-up take turns instead of overlapping
+        deadline = time.monotonic() + 900
+        while account_id in db.running_account_ids() and time.monotonic() < deadline:
+            time.sleep(5)
     acc = db.get_account(account_id, decrypt_cookies=True)
     if not acc or not acc.get("auth_token") or not acc.get("ct0"):
         return {"status": "error", "message": "account has no saved cookies", "exit_ip": "", "run_id": None}
@@ -348,7 +370,7 @@ def run_raid(account_id, tweet_id, action, reply_text="", raid_id=None):
         log.info("raid account %s -> routing via proxy %s", acc["name"], proxy["server"])
     else:
         log.info("raid account %s -> using local IP (no proxy)", acc["name"])
-    _current.update(account_id=account_id, name=acc["name"], action=action, trigger="raid")
+    _raid_current.update(account_id=account_id, name=acc["name"], action=action, tweet_id=tweet_id)
     started = datetime.now(db.TZ).isoformat(timespec="seconds")
     rid = db.start_run(account_id, started, "raid", action, tweet_id)
     is_single = raid_id is None
@@ -378,7 +400,7 @@ def run_raid(account_id, tweet_id, action, reply_text="", raid_id=None):
     db.bump_raid(raid_id, action, run_status == "ok")
     if is_single:
         db.finish_raid(raid_id, "completed" if run_status == "ok" else "failed")
-    _current.update(account_id=None, name=None, action=None, trigger=None)
+    _raid_current.update(account_id=None, name=None, action=None, tweet_id=None)
     log.info("raid %s #%s done: %s", action, account_id, counts)
     return {"status": run_status, "message": counts.get("error", ""), "exit_ip": exit_ip, "run_id": rid}
 

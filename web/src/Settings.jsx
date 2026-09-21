@@ -68,6 +68,7 @@ export default function Settings() {
   if (!(num(s.retweet_probability) >= 0 && num(s.retweet_probability) <= 1)) errs.retweet_probability = '0 – 1';
   if (!(num(s.min_delay_seconds) >= 0)) errs.min_delay_seconds = 'Must be ≥ 0';
   if (!(num(s.max_delay_seconds) >= 0)) errs.max_delay_seconds = 'Must be ≥ 0';
+  if (!(num(s.raid_step_gap) >= 0)) errs.raid_step_gap = 'Must be ≥ 0';
   const hasErrs = Object.keys(errs).length > 0;
 
   const dirty = saved ? JSON.stringify(s) !== JSON.stringify(saved) : false;
@@ -84,6 +85,8 @@ export default function Settings() {
       retweet_probability: +s.retweet_probability,
       min_delay_seconds: +s.min_delay_seconds,
       max_delay_seconds: +s.max_delay_seconds,
+      raid_independent: boolVal(s.raid_independent),
+      raid_step_gap: +s.raid_step_gap || 0,
       openai_model: s.openai_model,
       openai_post_system_prompt: s.openai_post_system_prompt,
       openai_reply_system_prompt: s.openai_reply_system_prompt,
@@ -140,8 +143,18 @@ export default function Settings() {
             <Field label="Max delay (s)" error={errs.max_delay_seconds}>
               <input type="number" min="0" value={s.max_delay_seconds} onChange={(e) => set('max_delay_seconds', e.target.value)} />
             </Field>
-            <Field label="Reply · min likes" hint="Reply to tweets with ≥ this many likes (Latest tab).">
+            <Field label="Reply · min likes" hint="">
               <input type="number" min="0" value={s.reply_min_likes} onChange={(e) => set('reply_min_likes', e.target.value)} />
+            </Field>
+          </div>
+        </Section>
+
+        <Section title="Raider" desc="Raid execution vs the warm-up scheduler. Human-delay pacing uses the min/max delay above — same logic as warm-up.">
+          <Toggle checked={boolVal(s.raid_independent)} onChange={(e) => set('raid_independent', e.target.checked)}
+                  label="Independent raids" desc="Raids run immediately in parallel — warm-up keeps running. If both hit the same account, that account's warm-up action slides ~12 min. Off = a raid waits for the account to be idle." />
+          <div className="set-row">
+            <Field label="Step gap (s)" hint="Extra randomized pause (±50%) between raid steps across accounts. 0 = back-to-back." error={errs.raid_step_gap}>
+              <input type="number" min="0" value={s.raid_step_gap} onChange={(e) => set('raid_step_gap', e.target.value)} />
             </Field>
           </div>
         </Section>
